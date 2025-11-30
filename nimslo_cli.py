@@ -54,7 +54,7 @@ def process_single_batch(
     import cv2
     import numpy as np
     from nimslo_core.preprocessing import preprocess_image, normalize_sizes
-    from nimslo_core.segmentation import get_segmentation_mask, visualize_mask
+    from nimslo_core.segmentation import get_segmentation_mask
     from nimslo_core.alignment import align_images
     from nimslo_core.gif_generator import create_boomerang_gif, resize_for_web
     
@@ -107,7 +107,13 @@ def process_single_batch(
         # Save mask visualization if requested
         if show_masks:
             mask_output = output_path.parent / f"{output_path.stem}_masks.jpg"
-            overlays = [visualize_mask(img, mask) for img, mask in zip(preprocessed, masks)]
+            # Simple mask overlay visualization
+            overlays = []
+            for img, mask in zip(preprocessed, masks):
+                overlay = img.copy()
+                mask_bool = mask > 127
+                overlay[mask_bool] = (0.7 * overlay[mask_bool] + 0.3 * np.array([0, 255, 0])).astype(np.uint8)
+                overlays.append(overlay)
             combined = np.hstack(overlays)
             # Resize for reasonable file size
             h, w = combined.shape[:2]

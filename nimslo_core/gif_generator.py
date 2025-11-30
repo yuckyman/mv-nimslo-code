@@ -142,13 +142,93 @@ def _normalize_brightness(images: List[np.ndarray], strength: float = 0.5) -> Li
     return normalized
 
 
+def _crop_based_on_transforms(images: List[np.ndarray], transforms: List[np.ndarray], margin: int = 10) -> List[np.ndarray]:
+    """
+    Crop images based on actual translation amounts from alignment transforms.
+    
+    For each frame that was translated, crops from the opposite side by that amount.
+    For example, if a frame moved 50px left, crop 50px from the right side.
+    
+    Args:
+        images: List of aligned images
+        transforms: List of 3x3 transformation matrices (one per image)
+        margin: Additional margin to add (in pixels)
+        
+    Returns:
+        List of cropped images
+    """
+    if not images or len(images) != len(transforms):
+        return images
+    
+    h, w = images[0].shape[:2]
+    
+    # Extract translation components from each transform
+    # Transform matrix: [a b tx]
+    #                   [c d ty]
+    #                   [0 0 1 ]
+    # tx = horizontal translation, ty = vertical translation
+    max_left_translation = 0   # Negative tx (moved left) -> black bars on right -> crop from right
+    max_right_translation = 0  # Positive tx (moved right) -> black bars on left -> crop from left
+    max_up_translation = 0     # Negative ty (moved up) -> black bars on bottom -> crop from bottom
+    max_down_translation = 0   # Positive ty (moved down) -> black bars on top -> crop from top
+    
+    for transform in transforms:
+        tx = transform[0, 2]  # Horizontal translation
+        ty = transform[1, 2]  # Vertical translation
+        
+        if tx < 0:  # Moved left, black bars appear on right
+            max_left_translation = max(max_left_translation, abs(tx))
+        elif tx > 0:  # Moved right, black bars appear on left
+            max_right_translation = max(max_right_translation, tx)
+        
+        if ty < 0:  # Moved up, black bars appear on bottom
+            max_up_translation = max(max_up_translation, abs(ty))
+        elif ty > 0:  # Moved down, black bars appear on top
+            max_down_translation = max(max_down_translation, ty)
+    
+    # Calculate crop amounts from each side
+    crop_left = int(max_right_translation) + margin if max_right_translation > 0 else margin
+    crop_right = int(max_left_translation) + margin if max_left_translation > 0 else margin
+    crop_top = int(max_down_translation) + margin if max_down_translation > 0 else margin
+    crop_bottom = int(max_up_translation) + margin if max_up_translation > 0 else margin
+    
+    # Calculate final crop region
+    x = crop_left
+    y = crop_top
+    valid_w = w - crop_left - crop_right
+    valid_h = h - crop_top - crop_bottom
+    
+    # Ensure we have a valid region (at least 100x100)
+    if valid_w < 100 or valid_h < 100:
+        # Fallback: use smaller margins
+        crop_left = min(crop_left, w // 4)
+        crop_right = min(crop_right, w // 4)
+        crop_top = min(crop_top, h // 4)
+        crop_bottom = min(crop_bottom, h // 4)
+        x = crop_left
+        y = crop_top
+        valid_w = w - crop_left - crop_right
+        valid_h = h - crop_top - crop_bottom
+    
+    # Final safety check
+    if valid_w <= 0 or valid_h <= 0 or x < 0 or y < 0 or x + valid_w > w or y + valid_h > h:
+        return images
+    
+    # Crop all images
+    cropped = [img[y:y+valid_h, x:x+valid_w] for img in images]
+    
+    return cropped
+
+
 def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin: int = 10) -> List[np.ndarray]:
     """
     Crop all images to the common valid (non-black) region.
     
     After warping, some images may have black borders. This finds
     the intersection of all valid regions and crops to it.
-    Optimized to handle vertical black bars from horizontal translation.
+    Optimized to handle vertical black bars from horizontal translation:
+    - Aggressively crops vertically (top/bottom black bars)
+    - Preserves horizontal dimensions (minimal horizontal cropping)
     
     Args:
         images: List of aligned images
@@ -190,44 +270,63 @@ def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin:
     
     x, y, valid_w, valid_h = cv2.boundingRect(coords)
     
-    # For vertical bars (horizontal translation), be more aggressive on horizontal cropping
-    # Check if we have significant vertical bars by analyzing column sums
+    # Analyze row sums to detect horizontal black bars (top/bottom)
+    # This helps us be more aggressive with vertical cropping
     gray_combined = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
-    col_sums = np.sum(gray_combined > threshold, axis=0)  # Sum of valid pixels per column
+    row_sums = np.sum(gray_combined > threshold, axis=1)  # Sum of valid pixels per row
     
-    # Find left and right boundaries more precisely
-    # Use a threshold: columns with less than 5% valid pixels are considered black bars
-    min_valid_pixels = h * 0.05
-    valid_cols = np.where(col_sums > min_valid_pixels)[0]
+    # Find top and bottom boundaries more precisely
+    # Use a threshold: rows with less than 5% valid pixels are considered black bars
+    min_valid_pixels_per_row = w * 0.05
+    valid_rows = np.where(row_sums > min_valid_pixels_per_row)[0]
+    
+    if len(valid_rows) > 0:
+        # Update y and valid_h based on row analysis (more aggressive vertical cropping)
+        new_y = max(0, valid_rows[0] - margin // 2)  # Smaller margin for vertical
+        new_h = min(h - new_y, valid_rows[-1] - valid_rows[0] + 1 + margin)  # Smaller margin
+        
+        # Use row-based cropping if it removes more black bars
+        if new_y > y or (new_y + new_h) < (y + valid_h):
+            y = new_y
+            valid_h = new_h
+    
+    # For horizontal dimension, be conservative - only crop if there are clear vertical bars
+    # Analyze column sums to detect vertical black bars (left/right)
+    col_sums = np.sum(gray_combined > threshold, axis=0)  # Sum of valid pixels per column
+    min_valid_pixels_per_col = h * 0.10  # Higher threshold - only crop if 10%+ of height is black
+    valid_cols = np.where(col_sums > min_valid_pixels_per_col)[0]
     
     if len(valid_cols) > 0:
-        # Update x and valid_w based on column analysis
-        new_x = max(0, valid_cols[0] - margin)
-        new_w = min(w - new_x, valid_cols[-1] - valid_cols[0] + 1 + 2 * margin)
+        # Only crop horizontally if there are significant vertical bars
+        # Be conservative: use larger margin and only if it's clearly a black bar
+        new_x = max(0, valid_cols[0] - margin * 2)  # Larger margin to preserve width
+        new_w = min(w - new_x, valid_cols[-1] - valid_cols[0] + 1 + margin * 4)  # Preserve more width
         
-        # Only use column-based cropping if it's more aggressive (removes more black bars)
-        if new_x > x or (new_x + new_w) < (x + valid_w):
+        # Only use column-based cropping if it's clearly removing black bars
+        # and doesn't crop too aggressively (preserve at least 80% of width)
+        if (new_x > x or (new_x + new_w) < (x + valid_w)) and new_w > w * 0.8:
             x = new_x
             valid_w = new_w
     
     # Add margin around valid region
-    x = max(0, x - margin)
-    y = max(0, y - margin)
-    valid_w = min(w - x, valid_w + 2 * margin)
-    valid_h = min(h - y, valid_h + 2 * margin)
+    # Use smaller vertical margin (more aggressive cropping) and larger horizontal margin (preserve width)
+    x = max(0, x - margin * 2)  # Larger horizontal margin to preserve width
+    y = max(0, y - margin // 2)  # Smaller vertical margin for aggressive cropping
+    valid_w = min(w - x, valid_w + margin * 4)  # Preserve more horizontal space
+    valid_h = min(h - y, valid_h + margin)  # Less vertical padding
     
     # Ensure minimum size (don't crop to nothing)
-    # But allow more aggressive cropping for width (vertical bars)
-    min_width = max(100, int(w * 0.3))  # At least 30% of original width
-    min_height = max(100, int(h * 0.5))  # At least 50% of original height
+    # Preserve more width, allow more aggressive height cropping
+    min_width = max(100, int(w * 0.75))  # Preserve at least 75% of original width
+    min_height = max(100, int(h * 0.3))  # Allow cropping to 30% of original height
     
     if valid_w < min_width or valid_h < min_height:
-        # If too aggressive, use original bounding box with smaller margin
+        # If too aggressive, use original bounding box with adjusted margins
         x, y, valid_w, valid_h = cv2.boundingRect(coords)
-        x = max(0, x - margin // 2)
-        y = max(0, y - margin // 2)
-        valid_w = min(w - x, valid_w + margin)
-        valid_h = min(h - y, valid_h + margin)
+        x = max(0, x - margin * 2)  # Preserve width
+        y = max(0, y - margin // 2)  # Aggressive vertical cropping
+        valid_w = min(w - x, valid_w + margin * 2)  # Preserve width
+        valid_h = min(h - y, valid_h + margin)  # Less vertical padding
     
     # Crop all images
     cropped = [img[y:y+valid_h, x:x+valid_w] for img in images]

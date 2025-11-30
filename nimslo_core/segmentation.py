@@ -1,8 +1,8 @@
 """
 Segmentation module for Nimslo images.
 
-Uses U²-Net (via rembg) for salient object detection,
-with optional depth-based fallback for difficult cases.
+Uses U²-Net (via rembg) for salient object detection.
+U²-Net or bust - no fallbacks.
 """
 
 import cv2
@@ -660,118 +660,22 @@ def _calculate_mask_confidence(mask: np.ndarray) -> float:
 
 
 def get_segmentation_mask(
-    img: np.ndarray,
-    confidence_threshold: float = 0.5,
-    fallback_to_depth: bool = True,
-    use_subprocess: bool = True,
-    prefer_lightweight: bool = True
+    img: np.ndarray
 ) -> Tuple[np.ndarray, float, str]:
     """
-    Get the best segmentation mask, with automatic method selection.
-    
-    Tries lightweight methods first (opencv_dnn, saliency) to avoid kernel crashes,
-    falls back to U²-Net or depth-based if needed.
+    Get segmentation mask using U²-Net (via rembg).
     
     Args:
         img: Input BGR image
-        confidence_threshold: Minimum confidence to accept result
-        fallback_to_depth: Whether to try depth method if other methods fail
-        use_subprocess: Use subprocess isolation for rembg (prevents kernel crashes)
-        prefer_lightweight: If True, prefer lightweight methods (opencv_dnn, saliency) over rembg
         
     Returns:
         Tuple of (mask, confidence, method_used)
+        
+    Raises:
+        RuntimeError: If U²-Net/rembg is not available
     """
-    mask = None
-    confidence = 0.0
-    method_used = "fallback"
-    
-    # Try lightweight methods first (safe for Jupyter)
-    if prefer_lightweight:
-        # Try OpenCV DNN (lightweight, no onnxruntime)
-        try:
-            mask, confidence = segment_subject(img, method="opencv_dnn", return_confidence=True)
-            if confidence >= confidence_threshold:
-                return mask, confidence, "opencv_dnn"
-            method_used = "opencv_dnn"
-        except Exception:
-            pass
-        
-        # Try saliency-based (pure OpenCV, very lightweight)
-        try:
-            saliency_mask, saliency_conf = segment_subject(img, method="saliency", return_confidence=True)
-            if saliency_conf > confidence:
-                mask = saliency_mask
-                confidence = saliency_conf
-                method_used = "saliency"
-        except Exception:
-            pass
-        
-        # Try improved GrabCut (uses saliency for initialization)
-        try:
-            grabcut_mask, grabcut_conf = segment_subject(img, method="grabcut", return_confidence=True)
-            if grabcut_conf > confidence:
-                mask = grabcut_mask
-                confidence = grabcut_conf
-                method_used = "grabcut"
-        except Exception:
-            pass
-    
-    # If lightweight methods didn't meet threshold, try heavier methods
-    if confidence < confidence_threshold:
-        # Try U-Net (better than depth-based, uses PyTorch)
-        try:
-            unet_mask, unet_conf = segment_subject(img, method="unet", return_confidence=True)
-            if unet_conf > confidence:
-                mask = unet_mask
-                confidence = unet_conf
-                method_used = "unet"
-        except Exception:
-            pass
-        
-        # Try U²-Net first (with subprocess isolation if requested)
-        if use_subprocess:
-            try:
-                from .segmentation_subprocess import segment_u2net_subprocess
-                u2net_mask, u2net_conf = segment_u2net_subprocess(img)
-                if u2net_conf > confidence:
-                    mask = u2net_mask
-                    confidence = u2net_conf
-                    method_used = "u2net_subprocess"
-            except Exception:
-                pass
-        
-        # Try direct U²-Net (may crash kernel in Jupyter)
-        try:
-            u2net_mask, u2net_conf = segment_subject(img, method="u2net", return_confidence=True)
-            if u2net_conf > confidence:
-                mask = u2net_mask
-                confidence = u2net_conf
-                method_used = "u2net"
-        except Exception:
-            pass
-        
-        # Fall back to depth-based segmentation (last resort)
-        if fallback_to_depth:
-            try:
-                depth_mask, depth_conf = segment_subject(img, method="depth", return_confidence=True)
-                if depth_conf > confidence:
-                    mask = depth_mask
-                    confidence = depth_conf
-                    method_used = "depth"
-            except Exception:
-                pass
-    
-    # Last resort: center mask
-    if mask is None or confidence < 0.2:
-        h, w = img.shape[:2]
-        fallback_mask = np.zeros((h, w), dtype=np.uint8)
-        y1, y2 = int(h*0.2), int(h*0.8)
-        x1, x2 = int(w*0.2), int(w*0.8)
-        fallback_mask[y1:y2, x1:x2] = 255
-        return fallback_mask, 0.3, "fallback"
-    
-    return mask, confidence, method_used
+    mask, confidence = _segment_u2net(img)
+    return mask, confidence, "u2net"
 
 
 def refine_mask_grabcut(

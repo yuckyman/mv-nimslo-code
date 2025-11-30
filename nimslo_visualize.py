@@ -216,8 +216,7 @@ def process_single_batch(
     viz_dir: Optional[Path] = None,
     quality: str = "balanced",
     show_masks: bool = False,
-    preview: bool = False,
-    seg_method: str = "unet"
+    preview: bool = False
 ) -> dict:
     """
     Process a single batch of 4 images with visualizations.
@@ -234,7 +233,7 @@ def process_single_batch(
         Dictionary with processing results
     """
     from nimslo_core.preprocessing import preprocess_image, normalize_sizes
-    from nimslo_core.segmentation import get_segmentation_mask, visualize_mask
+    from nimslo_core.segmentation import get_segmentation_mask
     from nimslo_core.alignment import align_images, extract_features, match_features
     from nimslo_core.gif_generator import create_boomerang_gif, resize_for_web
     
@@ -285,30 +284,14 @@ def process_single_batch(
         preprocessed = normalize_sizes(preprocessed)
         
         # Segment
-        if seg_method == "auto":
-            logger.info("  Segmenting subjects (auto method selection)...")
-            masks = []
-            mask_methods = []
-            for i, img in enumerate(preprocessed):
-                mask, conf, method = get_segmentation_mask(img)
-                masks.append(mask)
-                mask_methods.append(method)
-                logger.info(f"    Frame {i+1}: {method} (conf: {conf:.2f})")
-        else:
-            logger.info(f"  Segmenting subjects with {seg_method.upper()}...")
-            from nimslo_core.segmentation import segment_subject
-            masks = []
-            mask_methods = []
-            for i, img in enumerate(preprocessed):
-                try:
-                    mask, conf = segment_subject(img, method=seg_method, return_confidence=True)
-                    method = seg_method
-                except Exception as e:
-                    logger.warning(f"    Frame {i+1}: {seg_method} failed ({e}), falling back to auto method")
-                    mask, conf, method = get_segmentation_mask(img)
-                masks.append(mask)
-                mask_methods.append(method)
-                logger.info(f"    Frame {i+1}: {method} (conf: {conf:.2f})")
+        logger.info("  Segmenting subjects with U²-Net...")
+        masks = []
+        mask_methods = []
+        for i, img in enumerate(preprocessed):
+            mask, conf, method = get_segmentation_mask(img)
+            masks.append(mask)
+            mask_methods.append(method)
+            logger.info(f"    Frame {i+1}: {method} (conf: {conf:.2f})")
         
         # Visualize masks
         mask_type = mask_methods[0] if mask_methods else "unknown"
@@ -331,8 +314,15 @@ def process_single_batch(
         kp1, des1 = extract_features(centered_images[0], mask=centered_masks[0], n_features=settings["n_features"])
         kp2, des2 = extract_features(centered_images[1], mask=centered_masks[1], n_features=settings["n_features"])
         
-        logger.info(f"    Frame 1: {len(kp1)} keypoints")
-        logger.info(f"    Frame 2: {len(kp2)} keypoints")
+        # Calculate mask areas for diagnostics
+        mask1_area = np.sum(centered_masks[0] > 127) if centered_masks[0] is not None else 0
+        mask2_area = np.sum(centered_masks[1] > 127) if centered_masks[1] is not None else 0
+        img_area = centered_images[0].shape[0] * centered_images[0].shape[1]
+        mask1_pct = (mask1_area / img_area * 100) if img_area > 0 else 0
+        mask2_pct = (mask2_area / img_area * 100) if img_area > 0 else 0
+        
+        logger.info(f"    Frame 1: {len(kp1)} keypoints, {des1.shape[0] if des1 is not None else 0} descriptors (mask: {mask1_area}px, {mask1_pct:.1f}%)")
+        logger.info(f"    Frame 2: {len(kp2)} keypoints, {des2.shape[0] if des2 is not None else 0} descriptors (mask: {mask2_area}px, {mask2_pct:.1f}%)")
         
         # Match features
         matches = match_features(des1, des2)
@@ -367,23 +357,26 @@ def process_single_batch(
         logger.info("  Applying transformations to original images...")
         from nimslo_core.alignment import compose_transforms
         aligned_originals = []
+        all_transforms = []  # Store all composed transforms for cropping
         ref_h, ref_w = original_images[0].shape[:2]
         
         for i, (orig_img, result_obj, center_trans) in enumerate(zip(original_images, results, center_transforms)):
             if i == 0:
                 # Reference: only apply centering transform (center_trans is always 3x3)
                 aligned_originals.append(cv2.warpPerspective(orig_img, center_trans, (ref_w, ref_h)))
+                all_transforms.append(center_trans)
             else:
                 # Compose: center transform first, then alignment transform
                 # alignment transform is relative to centered images, so:
                 # final = alignment @ center (apply center first, then alignment)
                 composed_transform = compose_transforms(center_trans, result_obj.transform)
                 aligned_originals.append(cv2.warpPerspective(orig_img, composed_transform, (ref_w, ref_h)))
+                all_transforms.append(composed_transform)
         
-        # Crop to remove vertical black bars from horizontal translation
-        logger.info("  Cropping to remove black bars...")
-        from nimslo_core.gif_generator import _crop_to_valid_region
-        aligned_originals = _crop_to_valid_region(aligned_originals, threshold=15, margin=10)
+        # Crop based on actual translation amounts from transforms
+        logger.info("  Cropping based on translation amounts...")
+        from nimslo_core.gif_generator import _crop_based_on_transforms
+        aligned_originals = _crop_based_on_transforms(aligned_originals, all_transforms, margin=10)
         logger.info(f"    Cropped to {aligned_originals[0].shape[1]}x{aligned_originals[0].shape[0]}")
         
         # Visualize aligned original images (after cropping)
@@ -477,12 +470,6 @@ Examples:
         help="Enable verbose output"
     )
     
-    parser.add_argument(
-        "--seg-method",
-        choices=["unet", "u2net", "depth", "opencv_dnn", "saliency", "grabcut", "auto"],
-        default="unet",
-        help="Segmentation method to use (default: unet)"
-    )
     
     args = parser.parse_args()
     
@@ -511,8 +498,7 @@ Examples:
         output_path,
         viz_dir=args.viz_dir,
         quality=args.quality,
-        preview=args.preview,
-        seg_method=args.seg_method
+        preview=args.preview
     )
     
     if not result["success"]:
