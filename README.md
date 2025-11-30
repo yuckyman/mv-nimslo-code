@@ -1,4 +1,4 @@
-# Nimslo Image Alignment Pipeline
+# nap (nimslo alignment pipeline)
 
 a python pipeline for aligning 4-lens nimslo camera photos into smooth stereoscopic boomerang gifs. takes 4 slightly offset images and aligns them so the subject stays in place while the background shifts, creating that classic nimslo parallax effect.
 
